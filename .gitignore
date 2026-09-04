@@ -1,0 +1,24 @@
+# Секреты
+.env
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Логи
+*.log
+
+# Рантайм-данные и песочницы
+data/
+workspace/
+memory_history.json
+profile.json
+
+# Сгенерированный индекс базы знаний (пересобирается из athens_channel.json)
+knowledge/index.npz
+knowledge/chunks.json
+
+# Node
+node_modules/
