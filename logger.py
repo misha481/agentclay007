@@ -36,3 +36,13 @@ def log_crash(where, error):
     """Неперехваченная ошибка — пишем с полным стеком, а не одной строкой."""
     tb = "".join(traceback.format_exception(type(error), error, error.__traceback__))
     logger.error("CRASH %s: %s\n%s", where, error, tb)
+
+
+def log_llm_call(what, model):
+    """Обращения к модели раньше не логировались вовсе — из-за этого зависание
+    в ожидании ответа OpenRouter было не видно в agent.log."""
+    logger.info("LLM_CALL %s model=%s", what, model)
+
+
+def log_llm_result(what, duration_ms, body_bytes):
+    logger.info("LLM_RESULT %s duration_ms=%.1f bytes=%d", what, duration_ms, body_bytes)
