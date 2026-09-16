@@ -1,0 +1,35 @@
+# Секреты: ключи приходят на рантайме через env_file, а не запекаются в образ.
+.env
+
+.git/
+.gitignore
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Логи
+*.log
+
+# Рантайм-данные и песочницы (монтируются с хоста)
+data/
+workspace/
+memory_history.json
+profile.json
+
+# Сгенерированный индекс базы знаний (монтируется с хоста)
+knowledge/index.npz
+knowledge/chunks.json
+
+# Node
+node_modules/
+
+# Отдельный Node-подпроект, к агенту не относится
+dostoevsky_deck/
+
+# Сами файлы сборки в контекст не нужны
+Dockerfile
+docker-compose.yml
+.dockerignore

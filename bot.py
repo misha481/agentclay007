@@ -8,30 +8,91 @@
 """
 
 import asyncio
+import datetime
+import faulthandler
 import os
+import socket
+import sys
+import threading
+import traceback
 
 from aiogram import Bot, Dispatcher, F
 from aiogram.client.default import DefaultBotProperties
+from aiogram.client.session.aiohttp import AiohttpSession
 from aiogram.enums import ChatAction
 from aiogram.filters import Command, CommandStart
-from aiogram.types import Message
+from aiogram.types import FSInputFile, Message
 from dotenv import load_dotenv
 
 import core
 import logger as agent_logger
 import memory
+import pdftools
 
 TELEGRAM_MAX_CHARS = 4096
 TYPING_REFRESH_SECONDS = 4
+# Лимит Telegram на отправку документа ботом.
+MAX_UPLOAD_BYTES = 50 * 1024 * 1024
 
 WORKSPACE_DIR = os.path.join(core.BASE_DIR, "workspace")
+CRASH_LOG_PATH = os.path.join(core.BASE_DIR, "crash.log")
+
+# Держим файл открытым на всё время работы: faulthandler пишет в него уже из
+# аварийного обработчика, где открывать что-либо поздно.
+_crash_file = None
+
+
+def setup_crash_logging():
+    """Поймать то, чего не видно в agent.log.
+
+    Бот исчезал молча: ни трейсбэка, ни строки о перезапуске поллинга. Значит,
+    падение шло мимо except-ов — жёсткий сбой интерпретатора, неперехваченное
+    исключение вне хендлера или ошибка в фоновой задаче. Каждый из этих трёх
+    случаев теперь оставляет след в crash.log.
+    """
+    global _crash_file
+    _crash_file = open(CRASH_LOG_PATH, "a", encoding="utf-8", buffering=1)
+    _crash_file.write(
+        f"\n=== старт {datetime.datetime.now():%Y-%m-%d %H:%M:%S} pid={os.getpid()} ===\n"
+    )
+    # Segfault, переполнение стека, abort в C-расширении.
+    faulthandler.enable(file=_crash_file)
+
+    def on_uncaught(exc_type, exc, tb):
+        if issubclass(exc_type, KeyboardInterrupt):
+            sys.__excepthook__(exc_type, exc, tb)
+            return
+        agent_logger.log_crash("uncaught", exc)
+        traceback.print_exception(exc_type, exc, tb, file=_crash_file)
+
+    sys.excepthook = on_uncaught
+
+    def on_thread_exception(args):
+        if args.exc_value is not None:
+            agent_logger.log_crash(f"thread {args.thread.name}", args.exc_value)
+            traceback.print_exception(
+                args.exc_type, args.exc_value, args.exc_traceback, file=_crash_file
+            )
+
+    threading.excepthook = on_thread_exception
+
+
+def note_exit(reason):
+    """Отметить, чем закончился процесс: штатно или нет."""
+    stamp = f"{datetime.datetime.now():%Y-%m-%d %H:%M:%S}"
+    agent_logger.logger.info("BOT_EXIT %s", reason)
+    if _crash_file:
+        _crash_file.write(f"=== выход {stamp}: {reason} ===\n")
 
 HELP_TEXT = (
     "Я агент на Qwen через OpenRouter. Умею:\n"
     "• отвечать на вопросы и считать (калькулятор, кубик)\n"
+    "• искать в интернете и читать веб-страницы\n"
+    "• присылать книги в PDF по названию — на русском и английском "
+    "(классика в общественном достоянии)\n"
+    "• конвертировать текстовые файлы в PDF — пришли файл, и я верну PDF\n"
     "• искать по базе знаний канала «Афинская школа»\n"
-    "• запоминать факты о тебе между сессиями («запомни, что ...»)\n"
-    "• работать с файлами в своей песочнице workspace/\n\n"
+    "• запоминать факты о тебе между сессиями («запомни, что ...»)\n\n"
     "Команды:\n"
     "/clear — очистить историю диалога (профиль сохранится)\n"
     "/profile — показать, что я о тебе помню\n"
@@ -163,16 +224,28 @@ async def deny(message: Message):
     )
 
 
-@dp.message(F.text)
-async def handle_text(message: Message):
+async def send_artifacts(message, paths):
+    """Отправить файлы, созданные инструментами за этот ход."""
+    for path in paths:
+        try:
+            if not os.path.isfile(path):
+                continue
+            size = os.path.getsize(path)
+            if size > MAX_UPLOAD_BYTES:
+                await message.answer(
+                    f"Файл {os.path.basename(path)} слишком большой для Telegram "
+                    f"({size // 1024 // 1024} МБ, лимит 50 МБ)."
+                )
+                continue
+            await message.answer_document(FSInputFile(path))
+        except Exception as e:
+            agent_logger.log_tool_error("send_document", e)
+            await message.answer(f"Не удалось отправить файл {os.path.basename(path)}: {e}")
+
+
+async def process_turn(message, user_text):
+    """Один ход диалога: прогон через ядро, ответ и отправка файлов."""
     user_id = message.from_user.id
-    if not is_allowed(user_id):
-        return await deny(message)
-
-    text = (message.text or "").strip()
-    if not text:
-        return
-
     store = store_for(user_id)
     lock = lock_for(user_id)
 
@@ -186,11 +259,12 @@ async def handle_text(message: Message):
             keep_typing(message.bot, message.chat.id, stop_typing)
         )
 
+        artifacts = []
         try:
             messages = [core.build_system_message(store)] + store.load_history()
-            messages.append({"role": "user", "content": text})
+            messages.append({"role": "user", "content": user_text})
 
-            answer = await runtime.run_turn(messages, store)
+            answer = await runtime.run_turn(messages, store, artifacts=artifacts)
             store.save_history(messages[1:])
         except Exception as e:
             agent_logger.log_tool_error("telegram_turn", e)
@@ -199,18 +273,75 @@ async def handle_text(message: Message):
             stop_typing.set()
             await typing_task
 
-        await send_long(message, answer)
+        # Отправка тоже ходит в сеть и тоже может оборваться. Раньше исключение
+        # отсюда улетало из хендлера наружу.
+        try:
+            await send_long(message, answer)
+            if artifacts:
+                await send_artifacts(message, artifacts)
+        except Exception as e:
+            agent_logger.log_crash("send_answer", e)
+
+
+@dp.message(F.text)
+async def handle_text(message: Message):
+    if not is_allowed(message.from_user.id):
+        return await deny(message)
+
+    text = (message.text or "").strip()
+    if not text:
+        return
+    await process_turn(message, text)
+
+
+@dp.message(F.document)
+async def handle_document(message: Message):
+    """Присланный файл скачиваем в песочницу и передаём агенту."""
+    if not is_allowed(message.from_user.id):
+        return await deny(message)
+
+    doc = message.document
+    if doc.file_size and doc.file_size > MAX_UPLOAD_BYTES:
+        return await message.answer("Файл слишком большой (лимит 50 МБ).")
+
+    incoming_dir = os.path.join(WORKSPACE_DIR, "incoming")
+    os.makedirs(incoming_dir, exist_ok=True)
+    filename = pdftools.safe_filename(
+        os.path.splitext(doc.file_name or "file")[0]
+    ) + os.path.splitext(doc.file_name or "")[1]
+    dest = os.path.join(incoming_dir, filename or "file")
+
+    try:
+        await message.bot.download(doc, destination=dest)
+    except Exception as e:
+        agent_logger.log_tool_error("download_document", e)
+        return await message.answer(f"Не удалось скачать файл: {e}")
+
+    caption = (message.caption or "").strip()
+    rel = os.path.relpath(dest, WORKSPACE_DIR).replace("\\", "/")
+    task = caption or "Конвертируй этот файл в PDF и пришли мне."
+    await process_turn(message, f"{task}\n\n(файл сохранён как: {rel})")
 
 
 @dp.message()
 async def handle_other(message: Message):
     if not is_allowed(message.from_user.id):
         return await deny(message)
-    await message.answer("Пока понимаю только текст.")
+    await message.answer("Пока понимаю текст и файлы.")
 
 
 async def main():
     load_dotenv()
+
+    # Ошибка в фоновой задаче (например, в keep_typing) иначе тонет в stderr.
+    def on_loop_error(loop, context):
+        exc = context.get("exception")
+        if exc is not None:
+            agent_logger.log_crash("event_loop", exc)
+        else:
+            agent_logger.logger.error("CRASH event_loop: %s", context.get("message"))
+
+    asyncio.get_running_loop().set_exception_handler(on_loop_error)
 
     token = os.environ.get("TELEGRAM_BOT_TOKEN")
     if not token:
@@ -231,19 +362,50 @@ async def main():
     os.makedirs(WORKSPACE_DIR, exist_ok=True)
     await runtime.start(root_dir=WORKSPACE_DIR, use_mcp=True)
 
-    bot = Bot(token=token, default=DefaultBotProperties(parse_mode=None))
+    # DNS отдаёт для api.telegram.org и IPv6, и IPv4, но маршрут по IPv6 здесь
+    # нерабочий: запрос по нему падает мгновенно, тогда как IPv4 отвечает
+    # нормально. Без этой настройки aiohttp ходил по IPv6 и валился с
+    # "getaddrinfo failed" и таймаутами — из-за этого бот и падал.
+    session = AiohttpSession()
+    session._connector_init["family"] = socket.AF_INET
+
+    bot = Bot(token=token, session=session, default=DefaultBotProperties(parse_mode=None))
     me = await bot.get_me()
     print(f"\nБот @{me.username} запущен. Ctrl+C для остановки.\n")
 
+    # Сеть до api.telegram.org здесь нестабильна: длинный long-poll рвётся,
+    # и без этой обёртки процесс просто падал. Перезапускаем поллинг.
     try:
-        await dp.start_polling(bot)
+        attempt = 0
+        while True:
+            try:
+                await dp.start_polling(bot, polling_timeout=20, handle_signals=False)
+                break  # штатная остановка
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                attempt += 1
+                delay = min(5 * attempt, 60)
+                print(f"Поллинг оборвался ({type(e).__name__}: {e}). "
+                      f"Перезапуск через {delay} с (попытка {attempt}).")
+                agent_logger.log_tool_error("polling", e)
+                await asyncio.sleep(delay)
     finally:
         await runtime.stop()
         await bot.session.close()
 
 
 if __name__ == "__main__":
+    setup_crash_logging()
     try:
         asyncio.run(main())
+        note_exit("штатная остановка")
     except KeyboardInterrupt:
+        note_exit("Ctrl+C")
         print("\nОстановлен.")
+    except BaseException as e:
+        # SystemExit и MemoryError сюда тоже попадают — их и не хватало в логах.
+        agent_logger.log_crash("main", e)
+        traceback.print_exc(file=_crash_file)
+        note_exit(f"падение: {type(e).__name__}: {e}")
+        raise

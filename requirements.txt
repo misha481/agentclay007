@@ -3,3 +3,8 @@ python-dotenv
 mcp
 numpy
 aiogram
+reportlab
+httpx
+beautifulsoup4
+# Парсер для BeautifulSoup: BeautifulSoup(text, "lxml") в webtools/books.
+lxml

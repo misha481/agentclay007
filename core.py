@@ -10,31 +10,45 @@ import json
 import os
 import time
 
+import books
 import knowledge
 import llm_client
 import logger as agent_logger
 import memory
+import pdftools
 import tools
+import webtools
 from mcp_client import MCPFilesystemClient
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
 SYSTEM_PROMPT = (
-    "Ты — агент-помощник. "
-    "У тебя есть инструменты: бросок кубиков (roll_dice), подсчёт суммы чисел (sum_numbers), "
-    "калькулятор арифметических выражений (calculate), долговременная память "
-    "(remember, recall_facts, forget_fact), поиск по базе знаний "
-    "(search_knowledge) — архиву Telegram-канала «Афинская школа» о философии, "
-    "а также файловые инструменты с префиксом "
-    "fs__ (fs__read_file, fs__write_file, fs__list_directory и т.п.), предоставленные MCP-сервером "
-    "@modelcontextprotocol/server-filesystem, ограниченным разрешённой директорией. "
-    "Используй remember, когда пользователь просит что-то запомнить или сообщает важный факт "
-    "о себе, который стоит помнить между сессиями. "
-    "Если вопрос касается содержания канала «Афинская школа», философии или того, что писал "
-    "автор канала — сначала вызови search_knowledge и отвечай, опираясь на найденные фрагменты, "
-    "ссылаясь на номера сообщений. Если в базе ничего релевантного нет — скажи об этом прямо, "
-    "не выдумывай. Используй инструменты, когда это нужно для задачи. "
-    "Отвечай кратко и по делу."
+    "Ты — агент-помощник. Твои инструменты:\n"
+    "— roll_dice, sum_numbers, calculate — кубик, сумма чисел, арифметика;\n"
+    "— remember, recall_facts, forget_fact — долговременная память о пользователе;\n"
+    "— search_knowledge — поиск по базе знаний, архиву Telegram-канала "
+    "«Афинская школа» о философии;\n"
+    "— web_search, fetch_url — поиск в интернете и чтение веб-страниц;\n"
+    "— get_book_pdf, find_book — найти книгу по названию и прислать её текст в PDF;\n"
+    "— convert_file_to_pdf, make_pdf_from_text — сделать PDF из файла или текста;\n"
+    "— fs__* (fs__read_file, fs__write_file, fs__list_directory и т.п.) — файлы "
+    "в разрешённой директории через MCP-сервер.\n\n"
+    "Правила:\n"
+    "— Используй remember, когда пользователь просит что-то запомнить или сообщает "
+    "важный факт о себе, который стоит помнить между сессиями.\n"
+    "— Если вопрос о содержании канала «Афинская школа», философии или о том, что "
+    "писал автор канала — сначала вызови search_knowledge и отвечай, опираясь на "
+    "найденные фрагменты, со ссылками на номера сообщений. Если в базе ничего "
+    "релевантного нет — скажи прямо, не выдумывай.\n"
+    "— Для актуальных сведений, новостей и фактов, которых нет в базе знаний, "
+    "используй web_search, при необходимости открывай страницы через fetch_url. "
+    "Не выдумывай факты, которые можно проверить поиском.\n"
+    "— Когда просят книгу или её текст, вызывай get_book_pdf: файл отправится "
+    "пользователю сам. Доступна только классика в общественном достоянии "
+    "(Викитека для русского, Project Gutenberg для английского); современные книги "
+    "под авторским правом получить нельзя — в таком случае скажи об этом честно.\n"
+    "— Сборка книги занимает до двух минут, это нормально.\n"
+    "— Отвечай кратко и по делу."
 )
 
 MAX_TOOL_ITERATIONS = 12
@@ -51,7 +65,12 @@ class AgentRuntime:
     def __init__(self):
         self.mcp_client = None
         self.base_tool_schemas = (
-            tools.TOOL_SCHEMAS + memory.TOOL_SCHEMAS + knowledge.TOOL_SCHEMAS
+            tools.TOOL_SCHEMAS
+            + memory.TOOL_SCHEMAS
+            + knowledge.TOOL_SCHEMAS
+            + webtools.TOOL_SCHEMAS
+            + pdftools.TOOL_SCHEMAS
+            + books.TOOL_SCHEMAS
         )
         self.tool_schemas = list(self.base_tool_schemas)
         # Одна MCP-сессия на всех — вызовы сериализуем.
@@ -97,11 +116,14 @@ class AgentRuntime:
             await self.mcp_client.stop()
             self.mcp_client = None
 
-    def local_tool_functions(self, memory_store):
+    def local_tool_functions(self, memory_store, artifacts=None):
         return {
             **tools.TOOL_FUNCTIONS,
             **knowledge.TOOL_FUNCTIONS,
+            **webtools.TOOL_FUNCTIONS,
             **memory_store.tool_functions(),
+            **pdftools.tool_functions(artifacts),
+            **books.tool_functions(artifacts),
         }
 
     async def _call_tool(self, tool_call, tool_functions):
@@ -133,13 +155,14 @@ class AgentRuntime:
         agent_logger.log_tool_result(name, duration_ms, result)
         return name, args, result
 
-    async def run_turn(self, messages, memory_store, on_tool=None):
+    async def run_turn(self, messages, memory_store, on_tool=None, artifacts=None):
         """Прогнать один ход: цикл вызовов инструментов до финального ответа.
 
         messages изменяется на месте (messages[0] — системное сообщение).
-        Возвращает текст финального ответа модели.
+        artifacts (список) наполняется путями созданных файлов — бот отправляет
+        их пользователю. Возвращает текст финального ответа модели.
         """
-        tool_functions = self.local_tool_functions(memory_store)
+        tool_functions = self.local_tool_functions(memory_store, artifacts)
 
         for _ in range(MAX_TOOL_ITERATIONS):
             # Профиль мог измениться вызовом remember — пересобираем промпт.

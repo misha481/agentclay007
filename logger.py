@@ -2,6 +2,7 @@
 
 import logging
 import os
+import traceback
 
 LOG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "agent.log")
 
@@ -29,3 +30,9 @@ def log_tool_result(name, duration_ms, result):
 
 def log_tool_error(name, error):
     logger.error("TOOL_ERROR %s error=%s", name, error)
+
+
+def log_crash(where, error):
+    """Неперехваченная ошибка — пишем с полным стеком, а не одной строкой."""
+    tb = "".join(traceback.format_exception(type(error), error, error.__traceback__))
+    logger.error("CRASH %s: %s\n%s", where, error, tb)
