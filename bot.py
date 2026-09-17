@@ -14,17 +14,21 @@ import os
 import socket
 import sys
 import threading
+import time
 import traceback
 
 from aiogram import Bot, Dispatcher, F
 from aiogram.client.default import DefaultBotProperties
 from aiogram.client.session.aiohttp import AiohttpSession
 from aiogram.enums import ChatAction
-from aiogram.filters import Command, CommandStart
-from aiogram.types import FSInputFile, Message
+from aiogram.filters import Command, CommandObject, CommandStart
+from aiogram.types import BotCommand, FSInputFile, Message
 from dotenv import load_dotenv
 
+import books
 import core
+import knowledge
+import llm_client
 import logger as agent_logger
 import memory
 import pdftools
@@ -94,11 +98,27 @@ HELP_TEXT = (
     "• искать по базе знаний канала «Афинская школа»\n"
     "• запоминать факты о тебе между сессиями («запомни, что ...»)\n\n"
     "Команды:\n"
+    "/book <название> — прислать книгу в PDF\n"
     "/clear — очистить историю диалога (профиль сохранится)\n"
     "/profile — показать, что я о тебе помню\n"
+    "/status — как я себя чувствую\n"
     "/id — показать твой Telegram id\n"
-    "/help — эта справка"
+    "/help — эта справка\n\n"
+    "Всё это можно и просто словами — команды нужны только для скорости."
 )
+
+# Меню Telegram: по нему клиент подсказывает команды при первом обращении,
+# без него кнопка «/» в чате пустая и о командах можно узнать только из справки.
+BOT_COMMANDS = [
+    BotCommand(command="book", description="Прислать книгу в PDF"),
+    BotCommand(command="profile", description="Что я о тебе помню"),
+    BotCommand(command="clear", description="Очистить историю диалога"),
+    BotCommand(command="status", description="Как я себя чувствую"),
+    BotCommand(command="id", description="Твой Telegram id"),
+    BotCommand(command="help", description="Что я умею"),
+]
+
+STARTED_AT = None
 
 runtime = core.AgentRuntime()
 dp = Dispatcher()
@@ -214,6 +234,69 @@ async def cmd_profile(message: Message):
     if not is_allowed(message.from_user.id):
         return await deny(message)
     await message.answer(store_for(message.from_user.id).recall_facts())
+
+
+@dp.message(Command("book"))
+async def cmd_book(message: Message, command: CommandObject):
+    if not is_allowed(message.from_user.id):
+        return await deny(message)
+
+    query = (command.args or "").strip()
+    if not query:
+        return await message.answer(
+            "Напиши название после команды, например:\n"
+            "/book Гранатовый браслет Куприн\n\n"
+            "Доступна классика в общественном достоянии: Викитека для русского, "
+            "Project Gutenberg для английского."
+        )
+
+    # Сборка идёт мимо модели: книгу собирает тот же инструмент, что и в диалоге,
+    # но без лишнего хода к LLM — быстрее и нечему залипать на ответе OpenRouter.
+    stop_typing = asyncio.Event()
+    typing_task = asyncio.create_task(
+        keep_typing(message.bot, message.chat.id, stop_typing)
+    )
+    await message.answer(f"Ищу «{query}». Сборка занимает до пары минут.")
+
+    artifacts = []
+    try:
+        build = books.tool_functions(artifacts)["get_book_pdf"]
+        text = await asyncio.to_thread(build, {"title": query})
+    except Exception as e:
+        agent_logger.log_crash("cmd_book", e)
+        text = f"Не удалось собрать книгу: {e}"
+    finally:
+        stop_typing.set()
+        await typing_task
+
+    try:
+        await send_long(message, text)
+        if artifacts:
+            await send_artifacts(message, artifacts)
+    except Exception as e:
+        agent_logger.log_crash("cmd_book_send", e)
+
+
+@dp.message(Command("status"))
+async def cmd_status(message: Message):
+    if not is_allowed(message.from_user.id):
+        return await deny(message)
+
+    if STARTED_AT is None:
+        uptime = "неизвестно"
+    else:
+        seconds = int(time.monotonic() - STARTED_AT)
+        hours, rest = divmod(seconds, 3600)
+        uptime = f"{hours} ч {rest // 60} мин" if hours else f"{rest // 60} мин"
+
+    lines = [
+        f"Работаю: {uptime}",
+        f"Модель: {llm_client.chat_model()}",
+        f"Файловые инструменты: {'доступны' if runtime.mcp_client else 'недоступны'}",
+        f"База знаний: {'готова' if os.path.isfile(knowledge.INDEX_PATH) else 'не собрана'}",
+        f"Инструментов подключено: {len(runtime.tool_schemas)}",
+    ]
+    await message.answer("\n".join(lines))
 
 
 async def deny(message: Message):
@@ -371,6 +454,19 @@ async def main():
 
     bot = Bot(token=token, session=session, default=DefaultBotProperties(parse_mode=None))
     me = await bot.get_me()
+
+    # Без этого кнопка «/» в чате пустая: Telegram подсказывает команды только
+    # из зарегистрированного меню. Не критично для работы — если не прошло,
+    # продолжаем, команды всё равно действуют и перечислены в /help.
+    try:
+        await bot.set_my_commands(BOT_COMMANDS)
+        print(f"Меню команд зарегистрировано: {len(BOT_COMMANDS)} шт.")
+    except Exception as e:
+        print(f"Не удалось зарегистрировать меню команд: {e}")
+        agent_logger.log_tool_error("set_my_commands", e)
+
+    global STARTED_AT
+    STARTED_AT = time.monotonic()
     print(f"\nБот @{me.username} запущен. Ctrl+C для остановки.\n")
 
     # Сеть до api.telegram.org здесь нестабильна: длинный long-poll рвётся,
