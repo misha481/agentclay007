@@ -16,6 +16,7 @@ import llm_client
 import logger as agent_logger
 import memory
 import pdftools
+import systools
 import tools
 import webtools
 from mcp_client import MCPFilesystemClient
@@ -31,6 +32,7 @@ SYSTEM_PROMPT = (
     "— web_search, fetch_url — поиск в интернете и чтение веб-страниц;\n"
     "— get_book_pdf, find_book — найти книгу по названию и прислать её текст в PDF;\n"
     "— convert_file_to_pdf, make_pdf_from_text — сделать PDF из файла или текста;\n"
+    "— get_brightness, set_brightness — узнать и изменить яркость экрана компьютера;\n"
     "— fs__* (fs__read_file, fs__write_file, fs__list_directory и т.п.) — файлы "
     "в разрешённой директории через MCP-сервер.\n\n"
     "Правила:\n"
@@ -71,6 +73,7 @@ class AgentRuntime:
             + webtools.TOOL_SCHEMAS
             + pdftools.TOOL_SCHEMAS
             + books.TOOL_SCHEMAS
+            + systools.TOOL_SCHEMAS
         )
         self.tool_schemas = list(self.base_tool_schemas)
         # Одна MCP-сессия на всех — вызовы сериализуем.
@@ -124,6 +127,7 @@ class AgentRuntime:
             **memory_store.tool_functions(),
             **pdftools.tool_functions(artifacts),
             **books.tool_functions(artifacts),
+            **systools.TOOL_FUNCTIONS,
         }
 
     async def _call_tool(self, tool_call, tool_functions):
